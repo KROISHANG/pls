@@ -1,0 +1,294 @@
+-- // services
+local DataStoreService = game:GetService("DataStoreService") -- save player data between game sessions
+local RunService = game:GetService("RunService") -- for game loops and timing
+local TweenService = game:GetService("TweenService") -- for smooth pet movement animations
+local ReplicatedStorage = game:GetService("ReplicatedStorage") -- storage shared by server and clients
+local Players = game:GetService("Players") -- manage players in the game
+
+-- // datastores to save data
+local PetsDS = DataStoreService:GetDataStore("Pet") -- stores player pet name
+local CoinsDS = DataStoreService:GetDataStore("Coins") -- stores player coin balances
+
+-- // runtime tracking tables
+local collectingCoin: { [number]: Instance } = {} 
+-- tracks which coin each player is currently collecting to prevent errors and multiple collection
+
+local damageConns: { [number]: RBXScriptConnection } = {} 
+-- tracks each player heartbeat connections for coin damage loops to safely disconnect them when needed
+
+-- // configuration for gameplay balance
+local petPowers = { -- represents how much damage each pet type deals per second
+	Cat = 1,
+	Wolf = 2,
+	Dragon = 5,
+	Phoenix = 10
+}
+local coinRewards = { -- represents how much coin rewards players when destroyed 
+	Coin = 5,
+	CoinStack = 10,
+	CoinPile = 20
+}
+
+-- // references to important folders in the workspace
+local coinSpawns = workspace:WaitForChild("Spawns") 
+-- folder filled with coin spawn locations, only one coin at one spawn location
+
+local clickables = workspace:WaitForChild("Clickables") 
+-- folder where coins that are able to be damaged by pets are added
+
+-- // load data with error handling: if the datastore load fails, fallback value is used
+local function LoadData(ds: DataStore, key: string | number, fallback: any): any
+	local success, result = pcall(function()
+		return ds:GetAsync(key)
+	end)
+	-- this design prevents data loss due to temporary datastore failures
+	return (success and result) or fallback
+end
+
+-- // save data with pcall to avoid script stops on failures
+local function SaveData(ds: DataStore, key: string | number, value: any)
+	pcall(function()
+		ds:SetAsync(key, value)
+	end)
+end
+
+-- // create a pet model for a player based on pet name
+-- cloning makes sure that the original pet model is untouched and secured
+-- parenting pet to character lets it move along with the player and be cleaned up when player respawns
+local function CreatePetForCharacter(player: Player, petName: string): Model?
+	local petModel = ReplicatedStorage:WaitForChild("Pets"):FindFirstChild(petName)
+	if petModel and player.Character then
+		local clone = petModel:Clone()
+		clone.Name = player.Name .. "PET" -- unique name to prevent collisions with other instances
+		clone.Parent = player.Character
+		return clone
+	end
+	return nil
+end
+
+-- // play a tween that moves the pet smoothly to follow near the player
+-- tweening instead of instant repositioning prevents jittery movements for visual polish
+local function PlayPetFollowTween(petModel: Model, targetCFrame: CFrame): Tween
+	local tweenInfo = TweenInfo.new(0.25, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut)
+	return TweenService:Create(petModel.PrimaryPart, tweenInfo, { CFrame = targetCFrame })
+end
+
+-- // stops player during coins collection
+-- disconnects the damage loop to stop damaging the coin and memory leaks
+-- removes ownership of the coin so others can collect it
+local function StopCollecting(player: Player, coin: Instance?)
+	local userId = player.UserId
+	if damageConns[userId] then
+		damageConns[userId]:Disconnect()
+		damageConns[userId] = nil
+	end
+	collectingCoin[userId] = nil
+	if coin and coin:IsDescendantOf(workspace) then
+		coin:SetAttribute("Owner", nil) -- remove ownership to let others claim
+	end
+end
+
+-- // handles coin destruction when the health reaches zero or below
+-- makes sure only the owner gets rewarded to prevent exploits
+-- frees up the spawn point so new coins can appear there later
+-- coins are destroyed immediately to avoid multiple coins stacking in one position
+local function UpdateCoinHealthAndReward(coin: Instance)
+	if coin:FindFirstChild("Health") and coin.Health.Value <= 0 then
+		local ownerId = coin:GetAttribute("Owner")
+		if not ownerId then return end -- no owner means no one to reward
+
+		local player = Players:GetPlayerByUserId(ownerId)
+		local reward = coinRewards[coin.Name] or 0
+		local spawnPoint = coin:FindFirstChild("Spawn") and coin.Spawn.Value
+
+		if spawnPoint then
+			spawnPoint.Occupied.Value = false -- frees the spawn for future spawns
+		end
+		coin:Destroy() -- remove coin model from the game world
+
+		-- increase player coins if player still exists and has a coin tracker
+		if player and player:FindFirstChild("Coins") then
+			player.Coins.Value += reward
+		end
+	end
+end
+
+-- // returns the damage value of the pet by name, defaulting to 1 if unknown
+-- this function makes it easier to balance and add new pets in the future
+local function GetPetPower(petName: string): number
+	return petPowers[petName] or 1
+end
+
+-- // sets up interaction and damage logic for each coin
+-- uses clickdetector to let players to interact only when no one else owns/is damaging the coin
+-- starts a damage loop which reduces coin health as time passes when collecting
+-- positions pet in front of the coin to visually represent the pet is the one collecting the coins
+-- if player clicks the coin again, the collection stops, allowing toggling collection
+local function SetupCoin(coin: Model)
+	local clickDetector = coin:FindFirstChildWhichIsA("ClickDetector")
+	if not clickDetector then return end
+
+	coin:SetAttribute("Owner", nil) -- makes sure coin starts unclaimed
+
+	-- listen to health changes to detect when the coin will be destroyed
+	coin.Health.Changed:Connect(function()
+		UpdateCoinHealthAndReward(coin)
+	end)
+
+	clickDetector.MouseClick:Connect(function(player)
+		-- prevent other players from interrupting collections and makes sure coin has the attribute
+		if coin:GetAttribute("Owner") and coin:GetAttribute("Owner") ~= player.UserId then return end
+
+		-- player must have a pet to collect coins
+		local pet = player.Character and player.Character:FindFirstChild(player.Name .. "PET")
+		if not pet then return end
+
+		-- the coin's health display indicators
+		local display = coin:WaitForChild("Display")
+		local healthText = display:WaitForChild("Health")
+
+		-- if player isn't already collecting this coin, start the process
+		if not collectingCoin[player.UserId] then
+			collectingCoin[player.UserId] = coin
+			coin:SetAttribute("Owner", player.UserId) -- creates ownership to the coin
+			display.Enabled = true
+			healthText.Text = tostring(coin.Health.Value)
+
+			local sound = coin:FindFirstChild("ClickSound")
+			if sound then 
+				sound:Play() -- plays audio to improve gameplay experience
+			end
+
+			local coinPos = coin.PrimaryPart.Position
+			local petPart = pet.PrimaryPart
+			local offsetPos = coinPos + (petPart.CFrame.LookVector * -5)
+
+			local lastDamage = 0
+			-- setup damage loop using heartbeat for consistent timing
+			damageConns[player.UserId] = RunService.Heartbeat:Connect(function(dt)
+				if not coin:IsDescendantOf(workspace) or not coin:GetAttribute("Owner") then
+					-- if coin removed or ownership lost, stops the collection
+					StopCollecting(player, coin)
+					return
+				end
+
+				-- position pet 5 studs behind coin to face it, making it visually damaging
+				petPart.CFrame = CFrame.new(offsetPos, coinPos)
+				lastDamage += dt
+
+				if lastDamage >= 1 then -- damage dealt once per second to balance gameplay progressing
+					lastDamage = 0
+					if coin:FindFirstChild("Health") then
+						-- reduce health based on the pet damage value
+						coin.Health.Value -= GetPetPower(player.Pet.Value)
+						healthText.Text = tostring(coin.Health.Value) -- update gui to indicate the current coin's health
+					end
+				end
+			end)
+		elseif collectingCoin[player.UserId] == coin then
+			-- player clicked again on the same coin, stops collecting
+			StopCollecting(player, coin)
+			display.Enabled = false
+		end
+	end)
+end
+
+-- // attempts to spawn one coin per call at a free spawn location
+-- randomly selects coin type to add variety in rewards and gameplay experience
+-- using "occupied" attribute prevents coin stacking at the same location
+-- only spawns one coin per call to keep game balanced and not overwhelming
+local function SpawnCoin()
+	for _, spawnPoint in coinSpawns:GetChildren() do
+		if spawnPoint:IsA("BasePart") and not spawnPoint.Occupied.Value then
+			spawnPoint.Occupied.Value = true
+			local coinTypes = { "Coin", "CoinPile", "CoinStack" }
+			local chosenType = coinTypes[math.random(1, #coinTypes)]
+			local template = ReplicatedStorage.Coins:FindFirstChild(chosenType)
+
+			if template then
+				local coin = template:Clone()
+				coin.Spawn.Value = spawnPoint -- link coin to spawn for reference
+				coin:PivotTo(spawnPoint.CFrame) -- position coin to the spawn location
+				coin.Parent = clickables
+				SetupCoin(coin) -- setups coin for collection
+			end
+			break -- breaks the loop if a coin is spawned once already for balance
+		end
+	end
+end
+
+-- // sets player data and setup their character and gui on join
+-- loads saved pet data and coin amount to keep player progress
+-- listens for pet changes to save any upgrades or changes immediately
+local function SetupPlayer(player: Player)
+	-- pet string value for easy tracking and updating
+	local pet = Instance.new("StringValue")
+	pet.Name = "Pet"
+	pet.Value = LoadData(PetsDS, player.UserId, "Cat") -- default pet is cat if no saved data
+	pet.Parent = player
+
+	-- save any changes in pet selection immediately to prevent data loss
+	pet.Changed:Connect(function()
+		SaveData(PetsDS, player.UserId, pet.Value)
+	end)
+
+	-- everytime the player character spawns, create the pet model and make it follow the player
+	player.CharacterAdded:Connect(function(character)
+		local model = CreatePetForCharacter(player, pet.Value)
+		if not model then return end
+
+		local root = character:WaitForChild("HumanoidRootPart")
+		local busy = false
+
+		-- connect to heartbeat to update pet position every frame, but only if pet is not moving
+		RunService.Heartbeat:Connect(function()
+			if not busy and not collectingCoin[player.UserId] then
+				busy = true
+				-- use tween to smoothly move pet near the player when not busy collecting coins to represent it following the player
+				local tween = PlayPetFollowTween(model, root.CFrame * CFrame.new(0, 0, 5))
+				tween:Play()
+				tween.Completed:Wait()
+				busy = false
+				tween:Destroy()
+				-- destroy tween immediately after finished to prevent memory leaks
+			end
+		end)
+	end)
+
+	-- load and display the player saved coin amount
+	local gui = player:WaitForChild("PlayerGui"):WaitForChild("ScreenGui")
+	local label = gui:WaitForChild("Coins")
+
+	local coins = Instance.new("NumberValue")
+	coins.Name = "Coins"
+	coins.Value = LoadData(CoinsDS, player.UserId, 0)
+	coins.Parent = player
+
+	label.Text = tostring(coins.Value)
+
+	coins.Changed:Connect(function()
+		SaveData(CoinsDS, player.UserId, coins.Value) -- saves coin changes
+		label.Text = tostring(coins.Value) -- update gui indicator to the coin amount
+	end)
+end
+
+-- // when player joins, set up their data and event handlers
+Players.PlayerAdded:Connect(SetupPlayer)
+
+-- // when player leaves, clean up connections to prevent memory leaks
+Players.PlayerRemoving:Connect(function(player)
+	local userId = player.UserId
+	if damageConns[userId] then
+		damageConns[userId]:Disconnect()
+		damageConns[userId] = nil
+	end
+	collectingCoin[userId] = nil
+end)
+
+-- // run a background loop that tries to spawn coins every 5 seconds
+task.spawn(function()
+	while true do
+		task.wait(5)
+		SpawnCoin()
+	end
+end)
